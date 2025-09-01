@@ -1,0 +1,159 @@
+// firestore.rules
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --------- Helpers ---------
+    function isSignedIn() { return request.auth != null; }
+    function hasRole(r) { return isSignedIn() && request.auth.token.role == r; }
+    function isAdmin()   { return hasRole('admin'); }
+    function isArtisan() { return hasRole('artisan'); }
+    function isBuyer()   { return hasRole('buyer'); }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+
+    // Verify product ownership by reading the product doc
+    function ownsProduct(productId) {
+      return isSignedIn() &&
+             get(/databases/$(database)/documents/products/$(productId)).data.owner_user_id == request.auth.uid;
+    }
+
+    // Field guard utilities
+    function unchanged(field) {
+      return request.resource.data[field] == resource.data[field];
+    }
+
+    function onlyAllows(keys) {
+      return request.resource.data.diff(resource.data).changedKeys().hasOnly(keys);
+    }
+
+    // --------- Collections ---------
+
+    // PRODUCTS
+    match /products/{productId} {
+      // Public can read only active products; admins can read all.
+      allow get, list: if isAdmin() || (resource.data.is_active == true);
+
+      // Create: admin OR artisan creating a product they own
+      allow create: if isAdmin() ||
+                    (isArtisan() && request.resource.data.owner_user_id == request.auth.uid);
+
+      // Update: admin OR artisan updating own product; cannot change owner_user_id
+      allow update: if isAdmin() ||
+                    (isArtisan() &&
+                      resource.data.owner_user_id == request.auth.uid &&
+                      unchanged('owner_user_id'));
+
+      // Delete: admin OR artisan deleting own product
+      allow delete: if isAdmin() ||
+                    (isArtisan() && resource.data.owner_user_id == request.auth.uid);
+
+      // Optional: limit which fields artisans can modify (prevent tampering)
+      // Example: only these mutable fields for non-admin updates
+      allow update: if isAdmin() ||
+                    (isArtisan() &&
+                     resource.data.owner_user_id == request.auth.uid &&
+                     unchanged('owner_user_id') &&
+                     onlyAllows([
+                       'title','description','category','materials','region',
+                       'attributes','images','price','currency','inventory',
+                       'popularity','is_active','updated_at','created_at'
+                     ]));
+    }
+
+    // STORIES (docs keyed {productId}_{lang})
+    match /stories/{storyId} {
+      // Everyone can read stories (marketing content)
+      allow get, list: if true;
+
+      // Create/Update/Delete: admin OR artisan who owns the underlying product
+      // Story doc must carry product_id
+      allow create, update, delete:
+        if isAdmin() ||
+           (isArtisan() && ownsProduct(request.resource.data.product_id));
+
+      // Prevent changing product_id after creation
+      allow update: if isAdmin() ||
+                    (isArtisan() &&
+                     ownsProduct(resource.data.product_id) &&
+                     unchanged('product_id'));
+    }
+
+    // MARKETING ASSETS (keyed {productId}_{lang}_{channel})
+    match /marketing_assets/{assetId} {
+      allow get, list: if true;
+
+      allow create, update, delete:
+        if isAdmin() ||
+           (isArtisan() && ownsProduct(request.resource.data.product_id));
+
+      // Lock product_id after create
+      allow update: if isAdmin() ||
+                    (isArtisan() &&
+                     ownsProduct(resource.data.product_id) &&
+                     unchanged('product_id'));
+    }
+
+    // STORES
+    match /stores/{storeId} {
+      allow get, list: if true;
+
+      // Create: owner must be caller
+      allow create: if isAdmin() ||
+                    (isArtisan() && request.resource.data.owner_user_id == request.auth.uid);
+
+      // Update/Delete: owner or admin; owner_user_id immutable
+      allow update, delete:
+        if isAdmin() ||
+           (isArtisan() &&
+            resource.data.owner_user_id == request.auth.uid &&
+            unchanged('owner_user_id'));
+    }
+
+    // USERS
+    match /users/{userId} {
+      // User can read their own doc; admins can read all
+      allow get: if isAdmin() || isOwner(userId);
+
+      // Admin manages user docs (claims mirror, etc.)
+      allow create, delete: if isAdmin();
+
+      // Users may update limited profile fields on themselves; admin can update all
+      allow update:
+        if isAdmin() ||
+           (isOwner(userId) &&
+            onlyAllows([
+              'display_name','photo_url','phone','address','bio',
+              'updated_at','created_at'
+            ]));
+    }
+
+    // ORDERS
+    match /orders/{orderId} {
+      // Create: must be signed-in and create order for themselves
+      allow create: if isSignedIn() &&
+                    request.resource.data.user_id == request.auth.uid;
+
+      // Read: admin or the order owner
+      allow get, list: if isAdmin() ||
+                       (isSignedIn() && resource.data.user_id == request.auth.uid);
+
+      // Update/Delete: owner can modify limited fields; admin full
+      allow update: if isAdmin() ||
+                    (isSignedIn() &&
+                     resource.data.user_id == request.auth.uid &&
+                     onlyAllows([
+                       // allow owner to update shipping/tracking/status they control
+                       'shipping_address','shipping_phone','notes','status',
+                       'updated_at'
+                     ]));
+
+      allow delete: if isAdmin() ||
+                    (isSignedIn() && resource.data.user_id == request.auth.uid);
+    }
+
+    // EVENTS / AUDIT (admin only; not publicly readable)
+    match /events/{eventId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,7 @@
+.git
+__pycache__/
+.venv/
+.env
+service-account.json   # keep out of prod builds
+node_modules/
+*.pyc
